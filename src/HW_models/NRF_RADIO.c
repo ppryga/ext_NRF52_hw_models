@@ -74,7 +74,8 @@ static enum {TIFS_DISABLE = 0, TIFS_WAITING_FOR_DISABLE, TIFS_TRIGGERING_TRX_EN 
 bool TIFS_ToTxNotRx = false;
 bs_time_t Timer_TIFS = TIME_NEVER;
 
-static bs_time_t TX_ADDRESS_end_time, TX_PAYLOAD_end_time, TX_CRC_end_time;
+static bs_time_t TX_ADDRESS_end_time, TX_PAYLOAD_end_time, TX_CRC_end_time,
+    TX_CTE_end_time;
 
 //Ongoing Rx/Tx structures:
 static p2G4_rx_t  ongoing_rx;
@@ -84,6 +85,7 @@ static struct {
   bs_time_t ADDRESS_End_Time;
   bs_time_t PAYLOAD_End_Time;
   bs_time_t CRC_End_Time;
+  bs_time_t CTE_End_Time;
   bool packet_rejected;
   bool S1Offset;
 } ongoing_rx_RADIO_status;
@@ -110,9 +112,17 @@ typedef enum {
 } radio_state_t;
 static radio_state_t radio_state;
 
-typedef enum {SUB_STATE_INVALID, /*The timer should not trigger in TX or RX state with this substate*/
-  TX_WAIT_FOR_ADDRESS_END, TX_WAIT_FOR_PAYLOAD_END, TX_WAIT_FOR_CRC_END,
-  RX_WAIT_FOR_ADDRESS_END, RX_WAIT_FOR_PAYLOAD_END, RX_WAIT_FOR_CRC_END
+typedef enum {
+  SUB_STATE_INVALID, /*The timer should not trigger in TX or RX state with this
+                        substate*/
+  TX_WAIT_FOR_ADDRESS_END,
+  TX_WAIT_FOR_PAYLOAD_END,
+  TX_WAIT_FOR_CRC_END,
+  TX_WAIT_FOR_CTE_END,
+  RX_WAIT_FOR_ADDRESS_END,
+  RX_WAIT_FOR_PAYLOAD_END,
+  RX_WAIT_FOR_CRC_END,
+  RX_WAIT_FOR_CTE_END
 } radio_sub_state_t;
 
 static radio_sub_state_t radio_sub_state;
@@ -528,6 +538,24 @@ static void signal_END(){
   }
 }
 
+static void signal_PHYEND() {
+  nrf_radio_stop_bit_counter();
+
+  NRF_RADIO_regs.EVENTS_PHYEND = 1;
+  nrf_ppi_event(RADIO_EVENTS_PHYEND);
+
+  if (NRF_RADIO_regs.SHORTS & RADIO_SHORTS_PHYEND_DISABLE_Msk) {
+    nrf_radio_tasks_disable();
+  }
+  if (NRF_RADIO_regs.SHORTS & RADIO_SHORTS_PHYEND_START_Msk) {
+    nrf_radio_tasks_start();
+  }
+
+  if (RADIO_INTEN & RADIO_INTENSET_PHYEND_Msk) {
+    hw_irq_ctrl_set_irq(RADIO_IRQn);
+  }
+}
+
 static void signal_DISABLED(){
   nrf_radio_stop_bit_counter();
 
@@ -611,13 +639,26 @@ void nrf_radio_timer_triggered(){
       Timer_RADIO = TX_CRC_end_time;
       signal_PAYLOAD();
     } else if ( radio_sub_state == TX_WAIT_FOR_CRC_END ) {
-      radio_sub_state = SUB_STATE_INVALID;
+      if (TX_CTE_end_time) {
+        radio_sub_state = TX_WAIT_FOR_CTE_END;
+        Timer_RADIO = TX_CTE_end_time;
+        signal_END();
+      } else {
+        radio_sub_state = SUB_STATE_INVALID;
+        radio_state = TXIDLE;
+        NRF_RADIO_regs.STATE = TXIDLE;
+        Timer_RADIO = TIME_NEVER;
+        signal_END();
+        signal_PHYEND();
+        maybe_prepare_TIFS(true);
+      }
+    } else if (radio_sub_state == TX_WAIT_FOR_CTE_END) {
       radio_state = TXIDLE;
       NRF_RADIO_regs.STATE = TXIDLE;
       Timer_RADIO = TIME_NEVER;
-      signal_END();
-      maybe_prepare_TIFS(true);
-    }  else { //SUB_STATE_INVALID
+      NRF_RADIO_regs.EVENTS_CTEPRESENT = 1;
+      signal_PHYEND();
+    } else { // SUB_STATE_INVALID
       bs_trace_error_time_line("programming error\n");
     }
     nrf_hw_find_next_timer_to_trigger();
@@ -635,20 +676,36 @@ void nrf_radio_timer_triggered(){
       Timer_RADIO = ongoing_rx_RADIO_status.CRC_End_Time;
       nrf_hw_find_next_timer_to_trigger();
       signal_PAYLOAD();
-    } else if ( radio_sub_state == RX_WAIT_FOR_CRC_END ) {
+    } else if (radio_sub_state == RX_WAIT_FOR_CRC_END) {
+      if (ongoing_rx_RADIO_status.CRC_OK) {
+        signal_CRCOK();
+      } else {
+        signal_CRCERROR();
+      }
+      nrf_hw_find_next_timer_to_trigger();
+      if (ongoing_rx_RADIO_status.CTE_End_Time) {
+        radio_sub_state = RX_WAIT_FOR_CTE_END;
+        Timer_RADIO = ongoing_rx_RADIO_status.CTE_End_Time;
+        signal_END();
+      } else {
+        radio_sub_state = SUB_STATE_INVALID;
+        radio_state = RXIDLE;
+        NRF_RADIO_regs.STATE = RXIDLE;
+        Timer_RADIO = TIME_NEVER;
+        signal_END();
+        signal_PHYEND();
+        maybe_prepare_TIFS(false);
+      }
+    } else if (radio_sub_state == RX_WAIT_FOR_CTE_END) {
       radio_sub_state = SUB_STATE_INVALID;
       radio_state = RXIDLE;
       NRF_RADIO_regs.STATE = RXIDLE;
       Timer_RADIO = TIME_NEVER;
       nrf_hw_find_next_timer_to_trigger();
-      if ( ongoing_rx_RADIO_status.CRC_OK ) {
-        signal_CRCOK();
-      } else {
-        signal_CRCERROR();
-      }
-      signal_END();
+      NRF_RADIO_regs.EVENTS_CTEPRESENT = 1;
+      signal_PHYEND();
       maybe_prepare_TIFS(false);
-    } else { //SUB_STATE_INVALID
+    } else { // SUB_STATE_INVALID
       bs_trace_error_time_line("programming error\n");
     }
   } else if ( radio_state == TXDISABLE ){
@@ -836,6 +893,17 @@ static void start_Tx(){
   //Note only default freq. map supported
   double TxPower = (int8_t)( NRF_RADIO_regs.TXPOWER & RADIO_TXPOWER_TXPOWER_Msk); //the cast is to sign extend it
 
+  // Support for CTE fake transmission, there is no actual CTE TX but radio
+  // simulates TX/RX by setting up internal registers
+  uint8_t cte_time_us = 0;
+
+  if (NRF_RADIO_regs.DFEMODE != 0) {
+    cte_time_us =
+        (((NRF_RADIO_regs.DFECTRL1 & RADIO_DFECTRL1_NUMBEROF8US_Msk) >>
+          RADIO_DFECTRL1_NUMBEROF8US_Pos) *
+         8);
+  }
+
   if (NRF_RADIO_regs.MODE == RADIO_MODE_MODE_Ble_1Mbit) {
     preamble_len = 1; //1 byte
     ongoing_tx.radio_params.modulation = P2G4_MOD_BLE;
@@ -867,7 +935,8 @@ static void start_Tx(){
 
   bs_time_t tx_start_time = tm_get_abs_time() + radio_timings.TX_chain_delay;
   ongoing_tx.start_time = hwll_phy_time_from_dev(tx_start_time);
-  ongoing_tx.end_time = ongoing_tx.start_time + (bs_time_t)(packet_bitlen / bits_per_us);
+  ongoing_tx.end_time = ongoing_tx.start_time +
+                        (bs_time_t)(packet_bitlen / bits_per_us) + cte_time_us;
 
   //Prepare abort times:
   next_recheck_time = abort_ctrl_next_reevaluate_abort_time();
@@ -881,6 +950,11 @@ static void start_Tx(){
   TX_ADDRESS_end_time = tm_get_hw_time() + (bs_time_t)((preamble_len*8 + address_len*8)/bits_per_us);
   TX_PAYLOAD_end_time = TX_ADDRESS_end_time + (bs_time_t)(8*(header_len + payload_len)/bits_per_us);
   TX_CRC_end_time = TX_PAYLOAD_end_time + (bs_time_t)(crc_len*8/bits_per_us);
+  if (NRF_RADIO_regs.DFEMODE != 0) {
+    TX_CTE_end_time = TX_CRC_end_time + cte_time_us;
+  } else {
+    TX_CTE_end_time = 0;
+  }
 
   radio_sub_state = TX_WAIT_FOR_ADDRESS_END;
   Timer_RADIO = TX_ADDRESS_end_time;
@@ -926,6 +1000,7 @@ static void handle_Rx_response(int ret){
         hwll_dev_time_from_phy(ongoing_rx_done.rx_time_stamp
             + (bs_time_t)((2+length)*8/bits_per_us)
             + ongoing_rx_RADIO_status.CRC_duration); //Provisional value
+    ongoing_rx_RADIO_status.CTE_End_Time = TIME_NEVER;
 
     if (ongoing_rx_done.packet_size >= 5) { /*At least the header and CRC, otherwise better to not try to copy it*/
       ((uint8_t*)NRF_RADIO_regs.PACKETPTR)[0] = rx_buf[0];
@@ -933,6 +1008,47 @@ static void handle_Rx_response(int ret){
       /* We cheat a bit and copy the whole packet already (The AAR block will look in Adv packets after 64 bits)*/
       memcpy(&((uint8_t*)NRF_RADIO_regs.PACKETPTR)[2 + ongoing_rx_RADIO_status.S1Offset],
           &rx_buf[2] , length);
+
+      NRF_RADIO_regs.CTESTATUS = 0;
+      uint8_t cte_time_us = 0;
+      ongoing_rx_RADIO_status.CTE_End_Time = 0;
+      if (NRF_RADIO_regs.CTEINLINECONF &
+          RADIO_CTEINLINECONF_CTEINLINECTRLEN_Msk) {
+        if (NRF_RADIO_regs.CTEINLINECONF &
+            RADIO_CTEINLINECONF_CTEINFOINS1_Msk) {
+          // CTEInfo is in S1 byte, the DATA channel PDU
+          uint8_t s0_byte = rx_buf[0];
+          if (s0_byte & (0x1 << 0x6)) {
+            NRF_RADIO_regs.CTESTATUS = rx_buf[2];
+          }
+        } else {
+          // CTEInfo isn't in S1 byte, the ADVERTISING PDU
+          uint8_t pdu_type = rx_buf[0] & 0xF;
+          if (pdu_type == 0b0111) {
+            uint8_t ext_header_len = rx_buf[2] & 0b111111;
+            if (ext_header_len > 0) {
+              uint8_t ext_header_flags = rx_buf[3];
+              uint8_t cte_info_offset = 0;
+
+              if (ext_header_flags & (0x1)) {
+                // AdvA available
+                cte_info_offset += 6;
+              }
+              if (ext_header_flags & (0x2)) {
+                // TargetA available
+                cte_info_offset += 6;
+              }
+              if (ext_header_flags & 0x4) {
+                NRF_RADIO_regs.CTESTATUS = rx_buf[3 + cte_info_offset];
+                cte_time_us = (NRF_RADIO_regs.CTESTATUS & 0b11111) * 8;
+                ongoing_rx_RADIO_status.CTE_End_Time =
+                    ongoing_rx_RADIO_status.CRC_End_Time + cte_time_us;
+                NRF_RADIO_regs.DFEPACKET.AMOUNT = 33;
+              }
+            }
+          }
+        }
+      }
     }
 
     radio_sub_state = RX_WAIT_FOR_ADDRESS_END;
@@ -958,10 +1074,46 @@ static void handle_Rx_response(int ret){
       NRF_RADIO_regs.CRCSTATUS = 1;
     }
 
+    NRF_RADIO_regs.CTESTATUS = 0;
+    uint8_t cte_time_us = 0;
+    ongoing_rx_RADIO_status.CTE_End_Time = 0;
+    if (NRF_RADIO_regs.CTEINLINECONF &
+        RADIO_CTEINLINECONF_CTEINLINECTRLEN_Msk) {
+      if (NRF_RADIO_regs.CTEINLINECONF & RADIO_CTEINLINECONF_CTEINFOINS1_Msk) {
+        // CTEInfo is in S1 byte, the DATA channel PDU
+        uint8_t s0_byte = rx_buf[0];
+        if (s0_byte & (0x1 << 0x6)) {
+          NRF_RADIO_regs.CTESTATUS = rx_buf[2];
+        }
+      } else {
+        // CTEInfo isn't in S1 byte, the ADVERTISING PDU
+        uint8_t pdu_type = rx_buf[0] & 0xF;
+        if (pdu_type == 0b0111) {
+          uint8_t ext_header_len = rx_buf[2] & 0b111111;
+          if (ext_header_len > 0) {
+            uint8_t ext_header_flags = rx_buf[3];
+            uint8_t cte_info_offset = 0;
+
+            if (ext_header_flags & (0x1)) {
+              // AdvA available
+              cte_info_offset += 6;
+            }
+            if (ext_header_flags & (0x2)) {
+              // TargetA available
+              cte_info_offset += 6;
+            }
+            if (ext_header_flags & 0x4) {
+              NRF_RADIO_regs.CTESTATUS = rx_buf[3 + cte_info_offset];
+              cte_time_us = (NRF_RADIO_regs.CTESTATUS & 0b11111) * 8;
+              ongoing_rx_RADIO_status.CTE_End_Time =
+                  ongoing_rx_RADIO_status.CRC_End_Time + cte_time_us;
+            }
+          }
+        }
+      }
+    }
     nrf_ccm_radio_received_packet(!ongoing_rx_RADIO_status.CRC_OK);
-
   }
-
 }
 
 /**
@@ -1016,6 +1168,7 @@ static void start_Rx(){
   ongoing_rx_RADIO_status.CRC_duration = 3*8/bits_per_us;
   ongoing_rx_RADIO_status.CRC_OK = false;
   NRF_RADIO_regs.CRCSTATUS = 0;
+  NRF_RADIO_regs.CTESTATUS = 0;
 
   p2G4_freq_t center_freq;
   p2G4_freq_from_d(freq_off, 1, &center_freq);
